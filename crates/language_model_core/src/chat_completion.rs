@@ -346,6 +346,12 @@ struct RawToolCall {
     thought_signature: Option<String>,
 }
 
+impl RawToolCall {
+    fn is_valid(&self) -> bool {
+        !self.id.is_empty() && !self.name.is_empty()
+    }
+}
+
 /// Accumulates streamed tool calls, matching chunks by their ID and index when
 /// both are present. Either value alone is unreliable because some providers
 /// omit indices (#42584), reuse indices, or repeat IDs across parallel calls.
@@ -580,7 +586,7 @@ impl ChatCompletionEventMapper {
                         }
                     }
 
-                    if !entry.id.is_empty() && !entry.name.is_empty() {
+                    if entry.is_valid() {
                         if let Ok(input) =
                             serde_json::from_str::<Value>(&fix_streamed_json(&entry.arguments))
                         {
@@ -606,8 +612,14 @@ impl ChatCompletionEventMapper {
             }
             Some("tool_calls") => {
                 if !self.tool_call_accumulation_failed {
-                    events.extend(self.tool_calls.drain().map(
-                        |tool_call| match parse_tool_arguments(&tool_call.arguments) {
+                    events.extend(self.tool_calls.drain().map(|tool_call| {
+                        if !tool_call.is_valid() {
+                            let message =
+                                malformed_tool_call_message(&tool_call.id, &tool_call.name);
+                            return Ok(LanguageModelCompletionEvent::Text(message));
+                        }
+
+                        match parse_tool_arguments(&tool_call.arguments) {
                             Ok(input) => Ok(LanguageModelCompletionEvent::ToolUse(
                                 LanguageModelToolUse {
                                     id: tool_call.id.clone().into(),
@@ -624,8 +636,8 @@ impl ChatCompletionEventMapper {
                                 raw_input: tool_call.arguments.clone().into(),
                                 json_parse_error: error.to_string(),
                             }),
-                        },
-                    ));
+                        }
+                    }));
                 }
 
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::ToolUse)));
@@ -657,6 +669,25 @@ fn push_thinking_event(
         }));
     }
 }
+
+/// Returns a plain-text message explaining why a streamed tool call was
+/// rejected. This is surfaced as assistant text so the model sees the failure
+/// without receiving an invalid tool call in the conversation.
+fn malformed_tool_call_message(id: &str, name: &str) -> String {
+    match (id.is_empty(), name.is_empty()) {
+        (true, true) => MALFORMED_TOOL_CALL_NO_ID_NO_NAME.to_string(),
+        (true, false) => format!(
+            "The model returned a tool call named '{name}' with no id, so it cannot be used."
+        ),
+        (false, true) => format!(
+            "The model returned a tool call with id '{id}' but no name, so it cannot be used."
+        ),
+        (false, false) => unreachable!(),
+    }
+}
+
+const MALFORMED_TOOL_CALL_NO_ID_NO_NAME: &str =
+    "The model returned a tool call with no id and no name, so it cannot be used.";
 
 #[cfg(test)]
 mod tests {
@@ -1767,5 +1798,76 @@ mod tests {
         assert_eq!(tool_uses[0].raw_input, r#"{"city":"Berlin"}"#);
         assert_eq!(tool_uses[1].id.to_string(), "call_b");
         assert_eq!(tool_uses[1].raw_input, r#"{"city":"Tokyo"}"#);
+    }
+
+    // Malformed tool calls (empty id or name) must not be persisted as tool
+    // use history. They are surfaced as plain assistant text and the surviving
+    // well-formed calls still execute (#65655).
+    #[test]
+    fn malformed_tool_calls_are_surfaced_as_text_and_stripped_from_history() {
+        let mapped = map_completion_events(vec![
+            tool_call_chunk_event(vec![
+                ToolCallChunk {
+                    index: Some(0),
+                    id: Some("call_a".into()),
+                    function: Some(FunctionChunk {
+                        name: Some("list_directory".into()),
+                        arguments: Some(r#"{"path":"src"}"#.into()),
+                        thought_signature: None,
+                    }),
+                },
+                ToolCallChunk {
+                    index: Some(1),
+                    id: Some(String::new()),
+                    function: Some(FunctionChunk {
+                        name: Some(String::new()),
+                        arguments: Some("{}".into()),
+                        thought_signature: None,
+                    }),
+                },
+            ]),
+            finish_tool_calls_event(),
+        ]);
+
+        let valid_call = mapped.iter().any(|event| {
+            matches!(
+                event,
+                LanguageModelCompletionEvent::ToolUse(tool_use)
+                    if tool_use.id.to_string() == "call_a" && tool_use.name.as_ref() == "list_directory"
+            )
+        });
+        assert!(
+            valid_call,
+            "well-formed sibling should be emitted as ToolUse"
+        );
+
+        let malformed_text = mapped.iter().any(|event| {
+            matches!(
+                event,
+                LanguageModelCompletionEvent::Text(text)
+                    if text == MALFORMED_TOOL_CALL_NO_ID_NO_NAME
+            )
+        });
+        assert!(malformed_text, "malformed call should be surfaced as text");
+
+        let no_invalid_tool_use = mapped.iter().any(|event| {
+            matches!(
+                event,
+                LanguageModelCompletionEvent::ToolUse(tool_use)
+                    if tool_use.id.to_string().is_empty()
+            )
+        });
+        assert!(
+            !no_invalid_tool_use,
+            "malformed call should never be emitted as ToolUse"
+        );
+
+        assert!(
+            mapped.iter().any(|event| matches!(
+                event,
+                LanguageModelCompletionEvent::Stop(StopReason::ToolUse)
+            )),
+            "turn should continue as a tool-use turn"
+        );
     }
 }
